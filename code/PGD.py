@@ -1,6 +1,6 @@
 import torch
 class PGD:
-    def __init__(self, model,  eps=0.2, alpha=0.00009, restore_iters=3):
+    def __init__(self, model,  eps=0.2, alpha=0.07, restore_iters=3):
         self.model = model
         self.emb_name = 'embeddings'
         self.eps = eps

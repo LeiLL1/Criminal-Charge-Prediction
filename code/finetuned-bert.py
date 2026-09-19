@@ -9,30 +9,36 @@ from datetime import datetime
 from transformers import set_seed
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
-from transformers import BertTokenizer, BertForSequenceClassification, AdamW
+from transformers import BertTokenizer, BertForSequenceClassification
+from torch.optim import AdamW
 import numpy as np
 from PGD import PGD
 import random
+# 设备配置
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
 def parse_arguments():
-    #random_seed = random.randint(0, 10000)
-    random_seed = 9771
+    # #random_seed = random.randint(0, 10000)
+    # random_seed = 9771
+    # random_seed = 20000
+    # random_seed = 324
+
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--seed', type=int, default=random_seed, help="random seed for initialization.")
-    parser.add_argument('--batch_size', default=32, type=int, help="Total batch size for training.")
-    parser.add_argument('--epochs', default=10, type=int, help='The epoch of train')
+    parser.add_argument('--seed', type=int, default=123, help="random seed for initialization.")
+    parser.add_argument('--batch_size', default=4, type=int, help="Total batch size for training.")
+    parser.add_argument('--epochs', default=30, type=int, help='The epoch of train')
     parser.add_argument('--num_labels', default=193, type=int, help='The number of labels')
     parser.add_argument('--max_seq_length', default=512, type=int, help='The maximum length of squence')
     parser.add_argument('--learning_rate', default=5e-6, type=float, help="The initial learning rate for optimizer")
     parser.add_argument('--eval_freq', default=40, type=int, help='The freq of eval test set')
     parser.add_argument('--log_freq', default=20, type=int, help='The freq of print log')
-    parser.add_argument('--model_path', required=False, type=str, default="data_code\data\chinese-bert-wwm-ext",  help='The pretrained model')
-    parser.add_argument('--checkpoint_dir', type=str, default="data_code\ckpts", help="The directory of checkpoints")
-    parser.add_argument('--tensorboard_dir', type=str, default="data_code\\tensorboard", help="The directory of tensorboard")
-    parser.add_argument('--log_dir', type=str, default="data_code\log", help="The directory of log")
-    parser.add_argument('--train_data_path', type=str, required=False, default="data_code\data\large_193_train0.8",  help="The path of train Toxic Comment Classification Challenge dataset")
-    parser.add_argument('--eval_data_path', type=str, required=False, default="data_code\data\large_193_val0.1.zip",  help="The path of eval Toxic Comment Classification Challenge dataset")
+    parser.add_argument('--model_path', required=False, type=str, default="/home/CXL/pythonprojects/CrimePrediction/github/chinese-bert-wwm-ext",  help='The pretrained model')
+    parser.add_argument('--checkpoint_dir', type=str, default="ckpts", help="The directory of checkpoints")
+    parser.add_argument('--tensorboard_dir', type=str, default="tensorboard", help="The directory of tensorboard")
+    parser.add_argument('--log_dir', type=str, default="log", help="The directory of log")
+    parser.add_argument('--train_data_path', type=str, required=False, default="/home/CXL/pythonprojects/CrimePrediction/Data_Clearning/small_193_train0.8.csv",  help="The path of train Toxic Comment Classification Challenge dataset")
+    parser.add_argument('--eval_data_path', type=str, required=False, default="/home/CXL/pythonprojects/CrimePrediction/Data_Clearning/small_193_val0.1.csv",  help="The path of eval Toxic Comment Classification Challenge dataset")
 
     args = parser.parse_args()
 
@@ -299,14 +305,15 @@ class CustomDataset(Dataset):
     def __getitem__(self, idx):
         text = self.text_list[idx]
         label = self.label_list[idx]
-        encoding = self.tokenizer.encode_plus(
+        encoding = self.tokenizer(
             text,
             add_special_tokens=True,
-            max_length=self.max_length,
-            padding="max_length",
+            max_length=self.max_length,  # ← 改成 self.max_length
+            padding='max_length',
             truncation=True,
-            return_tensors="pt",
+            return_tensors='pt'
         )
+
         return {
             "input_ids": encoding["input_ids"].flatten(),
             "attention_mask": encoding["attention_mask"].flatten(),
@@ -336,7 +343,9 @@ def adjust_logits(logits):
     logits_clone = logits.clone()
 
     # 更新logits
-    logits_clone[range(logits.size(0)), max_indices] = 4*max_logits + x * abs_diff_np
+    abs_diff_tensor = torch.tensor(abs_diff_np, device=logits.device)
+    logits_clone[range(logits.size(0)), max_indices] = 1.5* max_logits + x * abs_diff_tensor
+
     return logits_clone
 
 def evaluation(model, val_loader, criterion):
@@ -477,7 +486,7 @@ def trainer():
                         ckpt_to_be_removed = most_recent_ckpts_paths.pop(0)
                         os.remove(ckpt_to_be_removed)
 
-        torch.save(model, f'data_code/Model/model{epoch}.pth')
+        torch.save(model, f'/home/CXL/pythonprojects/CrimePrediction/Bert/finetune_bert/finetune_bert/Model/model{epoch}.pth')
 
 if __name__ == '__main__':
     trainer()
