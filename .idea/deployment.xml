@@ -1,15 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="PublishConfigData" autoUpload="Always" serverName="CXL@154.9.253.153:12341 password" remoteFilesAllowedToDisappearOnAutoupload="false">
+  <component name="PublishConfigData" autoUpload="Always" serverName="4090" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
+    <option name="confirmBeforeUploading" value="false" />
     <serverData>
-      <paths name="CXL@154.9.253.153:12341 password">
-        <serverdata>
-          <mappings>
-            <mapping deploy="/tmp/pycharm_project_dbb0f021" local="$PROJECT_DIR$" />
-          </mappings>
-        </serverdata>
-      </paths>
-      <paths name="CXL@192.140.163.205:12341 password">
+      <paths name="4090">
         <serverdata>
           <mappings>
             <mapping deploy="/home/CXL/pythonprojects/CrimePrediction/Criminal-Charge-Prediction" local="$PROJECT_DIR$" web="/" />

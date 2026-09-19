@@ -13,9 +13,41 @@ from transformers import BertTokenizer, BertForSequenceClassification
 from torch.optim import AdamW
 import numpy as np
 from PGD import PGD
+from mask_experiment import DEFAULT_CATEGORIES, mask_text
 import random
 # 设备配置
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+active_gpu_ids = [0]
+
+
+def log_cuda_memory(stage):
+    """Log current and peak CUDA memory for every visible GPU."""
+    if not torch.cuda.is_available():
+        logger.info(f'CUDA memory [{stage}]: CUDA is unavailable; running on CPU.')
+        return
+
+    gib = 1024 ** 3
+    # 只查询本次运行明确选择的 GPU，避免访问其他繁忙 GPU。
+    for gpu_index in active_gpu_ids:
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info(gpu_index)
+            allocated_bytes = torch.cuda.memory_allocated(gpu_index)
+            reserved_bytes = torch.cuda.memory_reserved(gpu_index)
+            peak_allocated_bytes = torch.cuda.max_memory_allocated(gpu_index)
+            peak_reserved_bytes = torch.cuda.max_memory_reserved(gpu_index)
+            logger.info(
+                f'CUDA memory [{stage}] cuda:{gpu_index}: '
+                f'allocated={allocated_bytes / gib:.2f} GiB, '
+                f'reserved={reserved_bytes / gib:.2f} GiB, '
+                f'peak_allocated={peak_allocated_bytes / gib:.2f} GiB, '
+                f'peak_reserved={peak_reserved_bytes / gib:.2f} GiB, '
+                f'free={free_bytes / gib:.2f} GiB, '
+                f'total={total_bytes / gib:.2f} GiB.'
+            )
+        except Exception as error:
+            logger.warning(
+                f'CUDA memory [{stage}] cuda:{gpu_index}: query failed: {error}'
+            )
 
 def parse_arguments():
     # #random_seed = random.randint(0, 10000)
@@ -27,6 +59,13 @@ def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument('--seed', type=int, default=123, help="random seed for initialization.")
     parser.add_argument('--batch_size', default=4, type=int, help="Total batch size for training.")
+    parser.add_argument(
+        '--gpu_ids',
+        nargs='+',
+        type=int,
+        default=[0],
+        help='Visible CUDA indices to use, for example: --gpu_ids 0 or --gpu_ids 0 1.'
+    )
     parser.add_argument('--epochs', default=30, type=int, help='The epoch of train')
     parser.add_argument('--num_labels', default=193, type=int, help='The number of labels')
     parser.add_argument('--max_seq_length', default=512, type=int, help='The maximum length of squence')
@@ -34,11 +73,23 @@ def parse_arguments():
     parser.add_argument('--eval_freq', default=40, type=int, help='The freq of eval test set')
     parser.add_argument('--log_freq', default=20, type=int, help='The freq of print log')
     parser.add_argument('--model_path', required=False, type=str, default="/home/CXL/pythonprojects/CrimePrediction/github/chinese-bert-wwm-ext",  help='The pretrained model')
-    parser.add_argument('--checkpoint_dir', type=str, default="ckpts", help="The directory of checkpoints")
-    parser.add_argument('--tensorboard_dir', type=str, default="tensorboard", help="The directory of tensorboard")
-    parser.add_argument('--log_dir', type=str, default="log", help="The directory of log")
+    parser.add_argument('--checkpoint_dir', type=str, default="/home/CXL/pythonprojects/CrimePrediction/Criminal-Charge-Prediction/ckpts", help="The directory of checkpoints")
+    parser.add_argument('--tensorboard_dir', type=str, default="/home/CXL/pythonprojects/CrimePrediction/Criminal-Charge-Prediction/tensorboard", help="The directory of tensorboard")
+    parser.add_argument('--log_dir', type=str, default="/home/CXL/pythonprojects/CrimePrediction/Criminal-Charge-Prediction/log", help="The directory of log")
     parser.add_argument('--train_data_path', type=str, required=False, default="/home/CXL/pythonprojects/CrimePrediction/Data_Clearning/small_193_train0.8.csv",  help="The path of train Toxic Comment Classification Challenge dataset")
     parser.add_argument('--eval_data_path', type=str, required=False, default="/home/CXL/pythonprojects/CrimePrediction/Data_Clearning/small_193_val0.1.csv",  help="The path of eval Toxic Comment Classification Challenge dataset")
+    parser.add_argument(
+        '--mask_eval',
+        action='store_true',
+        help='Mask non-dispositive factual information in evaluation data only.'
+    )
+    parser.add_argument(
+        '--mask_categories',
+        nargs='+',
+        choices=DEFAULT_CATEGORIES,
+        default=list(DEFAULT_CATEGORIES),
+        help='Factual-information categories used when --mask_eval is enabled.'
+    )
 
     args = parser.parse_args()
 
@@ -283,9 +334,11 @@ def setup_training(config):
 
 
 class CustomDataset(Dataset):
-    def __init__(self, data_path, tokenizer, max_length):
+    def __init__(self, data_path, tokenizer, max_length, mask_categories=None):
         self.text_list = []
         self.label_list = []
+        self.mask_match_count = 0
+        self.masked_sample_count = 0
         self.tokenizer = tokenizer
         self.max_length = max_length
 
@@ -296,6 +349,10 @@ class CustomDataset(Dataset):
                 if idx == 0:
                     continue
                 else:
+                    if mask_categories:
+                        text, matches = mask_text(text, tuple(mask_categories))
+                        self.mask_match_count += len(matches)
+                        self.masked_sample_count += int(bool(matches))
                     self.text_list.append(text)
                     self.label_list.append(label)
 
@@ -374,14 +431,49 @@ def evaluation(model, val_loader, criterion):
     return accuracy, val_loss
 
 def trainer():
+    global device, active_gpu_ids
     config = parse_arguments()
+    if torch.cuda.is_available():
+        invalid_gpu_ids = [
+            gpu_id
+            for gpu_id in config.gpu_ids
+            if gpu_id < 0 or gpu_id >= torch.cuda.device_count()
+        ]
+        if invalid_gpu_ids:
+            raise ValueError(
+                f'Invalid --gpu_ids {invalid_gpu_ids}; visible CUDA device count is '
+                f'{torch.cuda.device_count()}.'
+            )
+        if len(set(config.gpu_ids)) != len(config.gpu_ids):
+            raise ValueError(f'--gpu_ids contains duplicate indices: {config.gpu_ids}')
+        active_gpu_ids = config.gpu_ids
+        device = torch.device(f'cuda:{active_gpu_ids[0]}')
+    else:
+        active_gpu_ids = []
+        device = torch.device('cpu')
     config, writer = setup_training(config)
     # 加载预训练的BERT模型和分词器
     tokenizer = BertTokenizer.from_pretrained(config.model_path)
     model = BertForSequenceClassification.from_pretrained(config.model_path, num_labels=config.num_labels)
 
-    model = nn.DataParallel(model)  # 将模型封装在 DataParallel 中
+    # model = nn.DataParallel(model)  # 原实现：无论 GPU 数量都启用 DataParallel
     model.to(device)
+    if len(active_gpu_ids) > 1:
+        model = nn.DataParallel(
+            model,
+            device_ids=active_gpu_ids,
+            output_device=active_gpu_ids[0],
+        )
+        logger.info(
+            f'Using DataParallel on GPUs {active_gpu_ids}; '
+            f'primary device: {device}.'
+        )
+    else:
+        logger.info(f'Using device: {device}.')
+    if torch.cuda.is_available():
+        for gpu_index in active_gpu_ids:
+            torch.cuda.reset_peak_memory_stats(gpu_index)
+    log_cuda_memory('after model initialization')
 
 
     # 创建数据加载器
@@ -390,6 +482,21 @@ def trainer():
 
     val_dataset = CustomDataset(config.eval_data_path, tokenizer, config.max_seq_length)
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size)
+    masked_val_loader = None
+    if config.mask_eval:
+        masked_val_dataset = CustomDataset(
+            config.eval_data_path,
+            tokenizer,
+            config.max_seq_length,
+            mask_categories=config.mask_categories,
+        )
+        masked_val_loader = DataLoader(masked_val_dataset, batch_size=config.batch_size)
+        logger.info(
+            f'Masked evaluation samples: {masked_val_dataset.masked_sample_count}/'
+            f'{len(masked_val_dataset)}; total masked spans: '
+            f'{masked_val_dataset.mask_match_count}; categories: '
+            f'{",".join(config.mask_categories)}'
+        )
 
     # 定义损失函数和优化器
     criterion = nn.CrossEntropyLoss()
@@ -421,20 +528,34 @@ def trainer():
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
             optimizer.zero_grad()
-            outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+            if step == 1:
+                log_cuda_memory('before first forward')
+            try:
+                outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+            except Exception as error:
+                if 'out of memory' in str(error).lower():
+                    log_cuda_memory('OOM during forward')
+                    logger.error(
+                        'CUDA OOM with batch_size={}, max_seq_length={}. '
+                        'Reduce --batch_size or --max_seq_length, or release memory '
+                        'used by other GPU processes.',
+                        config.batch_size,
+                        config.max_seq_length,
+                    )
+                raise
             logits = outputs.logits
 
-            pgd = PGD(model=model)
+            # pgd = PGD(model=model)
             ##
             # 调整logits
             # logits = adjust_logits(logits)
-            # loss = criterion(logits, labels)
+            loss = criterion(logits, labels)
             #####
             #
-            loss = outputs.loss
+            # loss = outputs.loss
             avg_loss += loss.item()
             loss.backward()
-            ###########
+            # ###########
             # pgd_k = 3
             # pgd.backup_grad()  # 备份模型参数的梯度
             # for _t in range(pgd_k):
@@ -457,6 +578,8 @@ def trainer():
             # # ###############
 
             optimizer.step()
+            if step == 1:
+                log_cuda_memory('after first optimizer step')
 
             # tensorboard
             writer.add_scalar('loss', loss, step)
@@ -472,6 +595,20 @@ def trainer():
                 acc, val_loss = evaluation(model, val_loader, criterion)
                 writer.add_scalar('acc', acc, step)
                 logger.info(f"epochs:{str(epoch) + '/' + str(config.epochs)}, step:{str(step) + '/' + str(total_step)}, avg_acc:{'{:.6f}'.format(acc)}")
+                if masked_val_loader is not None:
+                    masked_acc, masked_val_loss = evaluation(
+                        model, masked_val_loader, criterion
+                    )
+                    writer.add_scalar('masked_acc', masked_acc, step)
+                    writer.add_scalar('masked_val_loss', masked_val_loss, step)
+                    logger.info(
+                        f"epochs:{epoch}/{config.epochs}, step:{step}/{total_step}, "
+                        f"masked_acc:{masked_acc:.6f}, "
+                        f"masked_val_loss:{masked_val_loss:.6f}, "
+                        f"accuracy_drop:{acc - masked_acc:.6f}"
+                    )
+                if step == config.eval_freq:
+                    log_cuda_memory('after first evaluation')
 
                 # checkpoint path
                 if acc > global_acc or len(most_recent_ckpts_paths) < 3:
@@ -486,7 +623,7 @@ def trainer():
                         ckpt_to_be_removed = most_recent_ckpts_paths.pop(0)
                         os.remove(ckpt_to_be_removed)
 
-        torch.save(model, f'/home/CXL/pythonprojects/CrimePrediction/Bert/finetune_bert/finetune_bert/Model/model{epoch}.pth')
+        torch.save(model, f'/home/CXL/pythonprojects/CrimePrediction/Criminal-Charge-Prediction/Model/model{epoch}.pth')
 
 if __name__ == '__main__':
     trainer()
