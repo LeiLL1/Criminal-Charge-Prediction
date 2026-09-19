@@ -427,34 +427,34 @@ def trainer():
             pgd = PGD(model=model)
             ##
             # 调整logits
-            logits = adjust_logits(logits)
-            loss = criterion(logits, labels)
+            # logits = adjust_logits(logits)
+            # loss = criterion(logits, labels)
             #####
             #
-            # loss = outputs.loss
+            loss = outputs.loss
             avg_loss += loss.item()
             loss.backward()
             ###########
-            pgd_k = 3
-            pgd.backup_grad()  # 备份模型参数的梯度
-            for _t in range(pgd_k):
-                pgd.attack(is_first_attack=(_t == 0))  # PGD 类的 attack() 方法，执行对抗攻击
-
-                if _t != pgd_k - 1:
-                    model.zero_grad()
-                else:
-                    pgd.restore_grad()  # 如果是最后一次攻击，恢复模型参数的梯度
-
-                outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
-                logits = outputs.logits
-                logits = adjust_logits(logits)
-
-                loss = criterion(logits, labels)
-                # loss = outputs.loss
-                avg_loss += loss.item()
-                loss.backward()
-            pgd.restore()
-            # ###############
+            # pgd_k = 3
+            # pgd.backup_grad()  # 备份模型参数的梯度
+            # for _t in range(pgd_k):
+            #     pgd.attack(is_first_attack=(_t == 0))  # PGD 类的 attack() 方法，执行对抗攻击
+            #
+            #     if _t != pgd_k - 1:
+            #         model.zero_grad()
+            #     else:
+            #         pgd.restore_grad()  # 如果是最后一次攻击，恢复模型参数的梯度
+            #
+            #     outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+            #     logits = outputs.logits
+            #     logits = adjust_logits(logits)
+            #
+            #     loss = criterion(logits, labels)
+            #     # loss = outputs.loss
+            #     avg_loss += loss.item()
+            #     loss.backward()
+            # pgd.restore()
+            # # ###############
 
             optimizer.step()
 
