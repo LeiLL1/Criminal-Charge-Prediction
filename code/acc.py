@@ -3,10 +3,14 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import BertTokenizer
 import csv
 import argparse
+import os
 from sklearn.metrics import classification_report, accuracy_score, precision_recall_fscore_support
 import torch.nn as nn
 from transformers import BertForSequenceClassification
+from mask_experiment import DEFAULT_CATEGORIES, mask_text
 
+
+MASK_CATEGORIES = ('date', 'time', 'location', 'person')
 
 
 # 设备配置
@@ -212,11 +216,18 @@ VERBALIZER_INDEX_LABEL = {
 
 # 定义测试数据集类
 class TestDataset(Dataset):
-    def __init__(self, data_path, tokenizer, max_length):
+    def __init__(self, data_path, tokenizer, max_length, mask_categories=MASK_CATEGORIES):
         self.text_list = []
+        self.masked_text_list = []
         self.label_list = []
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.mask_categories = tuple(mask_categories)
+        self.mask_match_count = 0
+        self.masked_sample_count = 0
+        self.mask_category_match_counts = {
+            category: 0 for category in self.mask_categories
+        }
         self.missing_labels = set()  # 收集不存在的标签
 
         with open(data_path, encoding='utf-8') as f:
@@ -224,12 +235,22 @@ class TestDataset(Dataset):
             for idx, row in enumerate(reader):
                 if len(row) < 2:
                     continue
-                label, text = row
+                label = row[0]
+                # 保留文本中的逗号，避免因 CSV 行中存在未转义逗号而截断案件描述。
+                text = row[1] if len(row) == 2 else ','.join(row[1:])
                 if label not in VERBALIZER_INDEX_LABEL:
                     self.missing_labels.add(label)
                     continue  # 跳过不在 mapping 的标签
                 self.text_list.append(text)
                 self.label_list.append(label)
+
+                # 只在内存中生成 mask 后文本，不改写原始 CSV 文件。
+                masked_text, matches = mask_text(text, self.mask_categories)
+                self.masked_text_list.append(masked_text)
+                self.mask_match_count += len(matches)
+                self.masked_sample_count += int(bool(matches))
+                for match in matches:
+                    self.mask_category_match_counts[match.category] += 1
 
         if self.missing_labels:
             print("Warning: 以下标签不在 VERBALIZER_INDEX_LABEL 中，将被忽略：")
@@ -239,7 +260,7 @@ class TestDataset(Dataset):
         return len(self.text_list)
 
     def __getitem__(self, idx):
-        text = self.text_list[idx]
+        text = self.masked_text_list[idx]
         label = self.label_list[idx]
         encoding = self.tokenizer(
             text,
@@ -287,6 +308,8 @@ class TestDataset(Dataset):
 #
 # # 评估函数
 # # 评估函数
+
+
 criterion = nn.CrossEntropyLoss()
 def evaluate_model(model, test_loader, criterion):
     model.eval()
@@ -294,6 +317,8 @@ def evaluate_model(model, test_loader, criterion):
     all_labels = []
     total_loss = 0.0
 
+    if len(test_loader) == 0:
+        raise ValueError("测试数据集为空，无法进行 mask 后数据评估。")
 
     with torch.no_grad():
         for batch in test_loader:
@@ -317,10 +342,83 @@ def evaluate_model(model, test_loader, criterion):
     micro_precision, micro_recall, _, _ = precision_recall_fscore_support(all_labels, all_preds, average='micro')
 
     # 生成报告，忽略测试集中未出现的标签
-    labels = list(set(all_labels))  # 生成测试集中实际出现的标签
-    report = classification_report(all_labels, all_preds, labels=labels, target_names=[key for key in VERBALIZER_INDEX_LABEL.keys() if VERBALIZER_INDEX_LABEL[key] in labels], zero_division=0)
+    labels = sorted(set(all_labels))  # 生成测试集中实际出现的标签
+    target_names = [
+        key for key, value in VERBALIZER_INDEX_LABEL.items()
+        if value in labels
+    ]
+    report = classification_report(
+        all_labels,
+        all_preds,
+        labels=labels,
+        target_names=target_names,
+        zero_division=0,
+    )
 
     return avg_loss, accuracy, precision, recall, f1, macro_precision, macro_recall, micro_precision, micro_recall, report
+
+
+def resolve_model_paths(model_path, model_dir=None):
+    """Resolve all .pt checkpoints in the requested model directory."""
+    search_dir = model_dir
+    if search_dir is None:
+        search_dir = model_path if os.path.isdir(model_path) else os.path.dirname(model_path)
+
+    model_paths = []
+    if search_dir and os.path.isdir(search_dir):
+        for filename in sorted(os.listdir(search_dir)):
+            candidate = os.path.join(search_dir, filename)
+            if os.path.isfile(candidate) and filename.lower().endswith('.pt'):
+                model_paths.append(candidate)
+
+    if model_paths:
+        return model_paths
+    if model_path and os.path.isfile(model_path):
+        return [model_path]
+
+    raise FileNotFoundError(
+        f"未找到模型文件。model_path={model_path}, model_dir={model_dir}"
+    )
+
+
+def load_model(model_path, tokenizer_path):
+    checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
+
+    if isinstance(checkpoint, nn.Module):
+        # 兼容直接保存的完整模型。
+        model = checkpoint
+    else:
+        # 1. 先建“空模型”（结构必须一致）
+        model = BertForSequenceClassification.from_pretrained(
+            tokenizer_path,
+            num_labels=193  # ⚠️ 一定要和你训练时一样
+        )
+
+        # 2. 加载 checkpoint（这是 state_dict）
+        if not isinstance(checkpoint, dict):
+            raise TypeError(
+                f"不支持的 checkpoint 类型: {type(checkpoint).__name__}"
+            )
+        state_dict = checkpoint.get(
+            "state_dict",
+            checkpoint.get("model_state_dict", checkpoint),
+        )
+
+        # 3. 去掉 DataParallel 的 "module." 前缀
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith("module."):
+                new_state_dict[k[7:]] = v
+            else:
+                new_state_dict[k] = v
+
+        # 4. 加载参数
+        model.load_state_dict(new_state_dict, strict=True)
+
+    # 5. 上设备
+    model = model.to(device)
+    model.eval()
+    return model
 
 
 
@@ -328,11 +426,24 @@ def parse_arguments():
     parser = argparse.ArgumentParser()
 
 
-    parser.add_argument('--model_path', type=str, required=False, default='/home/CXL/pythonprojects/CrimePrediction/Bert/finetune_bert/finetune_bert/ckpts/2026-03-08T00-02-35/epoch26_step18800_acc0.826667.pt', help='Path to the saved model')
+    parser.add_argument('--model_path', type=str, required=False, default='/home/CXL/pythonprojects/CrimePrediction/Criminal-Charge-Prediction/ckpts/2026-09-19T16-52-33/epoch16_step11760_acc0.800000.pt', help='Path to the saved model')
     parser.add_argument('--tokenizer_path', type=str, required=False, default="/home/CXL/pythonprojects/CrimePrediction/github/chinese-bert-wwm-ext", help='Path to the pretrained tokenizer')
     parser.add_argument('--test_data_path', type=str, required=False, default="/home/CXL/pythonprojects/CrimePrediction/Data_Clearning/small_193_test0.1.csv",help='Path to the test data')
     parser.add_argument('--max_seq_length', type=int, default=512, help='Maximum sequence length')
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size for testing')
+    parser.add_argument(
+        '--model_dir',
+        type=str,
+        default=None,
+        help='Evaluate every .pt model in this directory. Defaults to the directory of --model_path.',
+    )
+    parser.add_argument(
+        '--mask_categories',
+        nargs='+',
+        choices=DEFAULT_CATEGORIES,
+        default=list(MASK_CATEGORIES),
+        help='Factual-information categories to mask in memory.',
+    )
     return parser.parse_args()
 
 
@@ -346,59 +457,60 @@ if __name__ == '__main__':
     # model.eval()
     # 先构建模型结构
 
-
-    # 1. 先建“空模型”（结构必须一致）
-    model = BertForSequenceClassification.from_pretrained(
-        args.tokenizer_path,
-        num_labels=193  # ⚠️ 一定要和你训练时一样
-    )
-
-    # 2. 加载 checkpoint（这是 state_dict）
-    state_dict = torch.load(args.model_path, map_location='cpu')
-
-    # 3. 去掉 DataParallel 的 "module." 前缀
-    new_state_dict = {}
-    for k, v in state_dict.items():
-        if k.startswith("module."):
-            new_state_dict[k[7:]] = v
-        else:
-            new_state_dict[k] = v
-
-    # 4. 加载参数
-    model.load_state_dict(new_state_dict, strict=True)
-
-    # 5. 上设备
-    model = model.to(device)
-    model.eval()
+    if set(args.mask_categories) != set(MASK_CATEGORIES):
+        raise ValueError(
+            f"必须且只能 mask date、time、location、person；"
+            f"当前配置为: {args.mask_categories}"
+        )
 
     tokenizer = BertTokenizer.from_pretrained(args.tokenizer_path)
 
     # 准备测试数据集
-    test_dataset = TestDataset(args.test_data_path, tokenizer, args.max_seq_length)
+    test_dataset = TestDataset(
+        args.test_data_path,
+        tokenizer,
+        args.max_seq_length,
+        mask_categories=args.mask_categories,
+    )
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size)
 
-    # 评估模型
-    test_loss, test_accuracy, precision, recall, f1, macro_precision, macro_recall, micro_precision, micro_recall, report = evaluate_model(model, test_loader, criterion)
+    model_paths = resolve_model_paths(args.model_path, args.model_dir)
+    print(f"Models to evaluate: {len(model_paths)}")
 
-    print(f"Test Loss: {test_loss:.4f}")
-    print(f"Test Accuracy: {test_accuracy:.4f}")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall: {recall:.4f}")
-    print(f"F1 Score: {f1:.4f}")
-    print(f"Macro Precision: {macro_precision:.4f}")
-    print(f"Macro Recall: {macro_recall:.4f}")
-    print(f"Micro Precision: {micro_precision:.4f}")
-    print(f"Micro Recall: {micro_recall:.4f}")
-    # print("\nClassification Report:\n", report)
+    for model_path in model_paths:
+        print("\n" + "=" * 80)
+        print(f"Model Path: {model_path}")
+        print("=" * 80)
 
-    # print("Precision per class:")
-    # for label, precision in precision_per_class.items():
-    #     print(f"  {label}: {precision:.4f}")
-    # print("Recall per class:")
-    # for label, recall in recall_per_class.items():
-    #     print(f"  {label}: {recall:.4f}")
-    # print("F1 Score per class:")
-    # for label, f1 in f1_per_class.items():
-    #     print(f"  {label}: {f1:.4f}")
+        model = load_model(model_path, args.tokenizer_path)
+
+        # 评估模型
+        test_loss, test_accuracy, precision, recall, f1, macro_precision, macro_recall, micro_precision, micro_recall, report = evaluate_model(model, test_loader, criterion)
+
+        # print(f"Test Loss: {test_loss:.4f}")
+        print(f"Test Accuracy: {test_accuracy:.4f}")
+        # print(f"Precision: {precision:.4f}")
+        # print(f"Recall: {recall:.4f}")
+        print(f"Macro Precision: {macro_precision:.4f}")
+        print(f"Macro Recall: {macro_recall:.4f}")
+        print(f"F1 Score: {f1:.4f}")
+        # print(f"Micro Precision: {micro_precision:.4f}")
+        # print(f"Micro Recall: {micro_recall:.4f}")
+        print(f"Mask Categories: {', '.join(MASK_CATEGORIES)}")
+        print(f"Masked Samples: {test_dataset.masked_sample_count}/{len(test_dataset)}")
+        print(f"Unmasked Samples: {len(test_dataset) - test_dataset.masked_sample_count}")
+        print(f"Matched Spans: {test_dataset.mask_match_count}")
+        for category in MASK_CATEGORIES:
+            print(
+                f"Matched {category}: "
+                f"{test_dataset.mask_category_match_counts[category]}"
+            )
+        # print("\nClassification Report:\n", report)
+
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 
 

@@ -13,7 +13,6 @@ from transformers import BertTokenizer, BertForSequenceClassification
 from torch.optim import AdamW
 import numpy as np
 from PGD import PGD
-from mask_experiment import DEFAULT_CATEGORIES, mask_text
 import random
 # 设备配置
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -78,19 +77,6 @@ def parse_arguments():
     parser.add_argument('--log_dir', type=str, default="/home/CXL/pythonprojects/CrimePrediction/Criminal-Charge-Prediction/log", help="The directory of log")
     parser.add_argument('--train_data_path', type=str, required=False, default="/home/CXL/pythonprojects/CrimePrediction/Data_Clearning/small_193_train0.8.csv",  help="The path of train Toxic Comment Classification Challenge dataset")
     parser.add_argument('--eval_data_path', type=str, required=False, default="/home/CXL/pythonprojects/CrimePrediction/Data_Clearning/small_193_val0.1.csv",  help="The path of eval Toxic Comment Classification Challenge dataset")
-    parser.add_argument(
-        '--mask_eval',
-        action='store_true',
-        help='Mask non-dispositive factual information in evaluation data only.'
-    )
-    parser.add_argument(
-        '--mask_categories',
-        nargs='+',
-        choices=DEFAULT_CATEGORIES,
-        default=list(DEFAULT_CATEGORIES),
-        help='Factual-information categories used when --mask_eval is enabled.'
-    )
-
     args = parser.parse_args()
 
     return args
@@ -334,11 +320,9 @@ def setup_training(config):
 
 
 class CustomDataset(Dataset):
-    def __init__(self, data_path, tokenizer, max_length, mask_categories=None):
+    def __init__(self, data_path, tokenizer, max_length):
         self.text_list = []
         self.label_list = []
-        self.mask_match_count = 0
-        self.masked_sample_count = 0
         self.tokenizer = tokenizer
         self.max_length = max_length
 
@@ -349,10 +333,6 @@ class CustomDataset(Dataset):
                 if idx == 0:
                     continue
                 else:
-                    if mask_categories:
-                        text, matches = mask_text(text, tuple(mask_categories))
-                        self.mask_match_count += len(matches)
-                        self.masked_sample_count += int(bool(matches))
                     self.text_list.append(text)
                     self.label_list.append(label)
 
@@ -482,21 +462,6 @@ def trainer():
 
     val_dataset = CustomDataset(config.eval_data_path, tokenizer, config.max_seq_length)
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size)
-    masked_val_loader = None
-    if config.mask_eval:
-        masked_val_dataset = CustomDataset(
-            config.eval_data_path,
-            tokenizer,
-            config.max_seq_length,
-            mask_categories=config.mask_categories,
-        )
-        masked_val_loader = DataLoader(masked_val_dataset, batch_size=config.batch_size)
-        logger.info(
-            f'Masked evaluation samples: {masked_val_dataset.masked_sample_count}/'
-            f'{len(masked_val_dataset)}; total masked spans: '
-            f'{masked_val_dataset.mask_match_count}; categories: '
-            f'{",".join(config.mask_categories)}'
-        )
 
     # 定义损失函数和优化器
     criterion = nn.CrossEntropyLoss()
@@ -545,7 +510,7 @@ def trainer():
                 raise
             logits = outputs.logits
 
-            # pgd = PGD(model=model)
+            pgd = PGD(model=model)
             ##
             # 调整logits
             # logits = adjust_logits(logits)
@@ -556,25 +521,25 @@ def trainer():
             avg_loss += loss.item()
             loss.backward()
             # ###########
-            # pgd_k = 3
-            # pgd.backup_grad()  # 备份模型参数的梯度
-            # for _t in range(pgd_k):
-            #     pgd.attack(is_first_attack=(_t == 0))  # PGD 类的 attack() 方法，执行对抗攻击
-            #
-            #     if _t != pgd_k - 1:
-            #         model.zero_grad()
-            #     else:
-            #         pgd.restore_grad()  # 如果是最后一次攻击，恢复模型参数的梯度
-            #
-            #     outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
-            #     logits = outputs.logits
-            #     logits = adjust_logits(logits)
-            #
-            #     loss = criterion(logits, labels)
-            #     # loss = outputs.loss
-            #     avg_loss += loss.item()
-            #     loss.backward()
-            # pgd.restore()
+            pgd_k = 3
+            pgd.backup_grad()  # 备份模型参数的梯度
+            for _t in range(pgd_k):
+                pgd.attack(is_first_attack=(_t == 0))  # PGD 类的 attack() 方法，执行对抗攻击
+
+                if _t != pgd_k - 1:
+                    model.zero_grad()
+                else:
+                    pgd.restore_grad()  # 如果是最后一次攻击，恢复模型参数的梯度
+
+                outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+                logits = outputs.logits
+                logits = adjust_logits(logits)
+
+                loss = criterion(logits, labels)
+                # loss = outputs.loss
+                avg_loss += loss.item()
+                loss.backward()
+            pgd.restore()
             # # ###############
 
             optimizer.step()
@@ -595,18 +560,6 @@ def trainer():
                 acc, val_loss = evaluation(model, val_loader, criterion)
                 writer.add_scalar('acc', acc, step)
                 logger.info(f"epochs:{str(epoch) + '/' + str(config.epochs)}, step:{str(step) + '/' + str(total_step)}, avg_acc:{'{:.6f}'.format(acc)}")
-                if masked_val_loader is not None:
-                    masked_acc, masked_val_loss = evaluation(
-                        model, masked_val_loader, criterion
-                    )
-                    writer.add_scalar('masked_acc', masked_acc, step)
-                    writer.add_scalar('masked_val_loss', masked_val_loss, step)
-                    logger.info(
-                        f"epochs:{epoch}/{config.epochs}, step:{step}/{total_step}, "
-                        f"masked_acc:{masked_acc:.6f}, "
-                        f"masked_val_loss:{masked_val_loss:.6f}, "
-                        f"accuracy_drop:{acc - masked_acc:.6f}"
-                    )
                 if step == config.eval_freq:
                     log_cuda_memory('after first evaluation')
 

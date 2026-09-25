@@ -119,7 +119,12 @@ PATTERNS = {
 }
 
 
-def _find_matches(text, categories):
+def find_matches(text, categories=DEFAULT_CATEGORIES):
+    """Return non-overlapping factual-information spans in character offsets."""
+    unknown = set(categories) - set(PATTERNS)
+    if unknown:
+        raise ValueError(f"Unknown mask categories: {sorted(unknown)}")
+
     matches = []
     for category in categories:
         priority, regexes = PATTERNS[category]
@@ -142,11 +147,7 @@ def _find_matches(text, categories):
 
 def mask_text(text, categories=DEFAULT_CATEGORIES):
     """Return masked text and the accepted non-overlapping matches."""
-    unknown = set(categories) - set(PATTERNS)
-    if unknown:
-        raise ValueError(f"Unknown mask categories: {sorted(unknown)}")
-
-    matches = _find_matches(text, categories)
+    matches = find_matches(text, categories)
     pieces = []
     cursor = 0
     for match in matches:
